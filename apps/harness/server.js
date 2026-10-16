@@ -2,6 +2,8 @@ import http from "node:http";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { buildPaymentRequirement, buildMockPayment, buildPaymentResponse, decodePaymentHeader, encodeRequirement, paymentRailId, paymentRequirementId, PAYMENT_SIGNATURE, PAYMENT_REQUIRED, PAYMENT_RESPONSE, verifyAndSettlePayment } from "../../packages/protocol/x402.js";
 import { buildPolicy, loadDatasets, runPrivateCompute } from "./private-compute.js";
 import { issueZkOAuthProof, verifyZkOAuthProof } from "./zk-oauth.js";
@@ -53,6 +55,7 @@ const PUBLIC_DIR = path.join(__dirname, "public");
 const ROOT_DIR = path.join(__dirname, "..", "..");
 const pendingJobs = new Map();
 const oidcSessions = new Map();
+const execFileAsync = promisify(execFile);
 
 loadLocalEnv(ROOT_DIR);
 
@@ -159,7 +162,144 @@ async function serveVendor(req, res) {
   });
   res.end(data);
 }
+async function handleFinancialProof(req, res) {
+  const body = await readJson(req);
 
+  const initialCapital =
+    Number(body.initialCapital);
+
+  const monthlyContribution =
+    Number(body.monthlyContribution);
+
+    const annualRatePpm =
+  Number(body.annualRatePpm);
+
+  const monthlyRatePpm =
+    Number(body.monthlyRatePpm);
+
+  const months =
+    Number(body.months ?? 120);
+
+  if (
+    !Number.isFinite(initialCapital) ||
+    initialCapital < 0
+  ) {
+    sendJson(res, 400, {
+      error: "invalid_initial_capital"
+    });
+    return;
+  }
+
+  if (
+    !Number.isFinite(monthlyContribution) ||
+    monthlyContribution < 0
+  ) {
+    sendJson(res, 400, {
+      error: "invalid_monthly_contribution"
+    });
+    return;
+  }
+
+  if (
+    !Number.isInteger(monthlyRatePpm) ||
+    monthlyRatePpm < 0
+  ) {
+    sendJson(res, 400, {
+      error: "invalid_monthly_rate_ppm"
+    });
+    return;
+  }
+
+  if (
+  !Number.isInteger(months) ||
+  months < 1 ||
+  months > 360
+) {
+  sendJson(res, 400, {
+    error: "unsupported_term",
+    message:
+      "O circuito ZK suporta prazos entre 1 e 360 meses."
+  });
+  return;
+}
+
+  const initialCapitalCents =
+    Math.round(initialCapital * 100);
+
+  const monthlyContributionCents =
+    Math.round(monthlyContribution * 100);
+
+  const scriptPath =
+    path.join(
+      ROOT_DIR,
+      "scripts",
+      "financial-mission-proof.mjs"
+    );
+
+  const env = {
+    ...process.env,
+
+    FIN_INITIAL_CAPITAL_CENTS:
+      String(initialCapitalCents),
+
+    FIN_MONTHLY_CONTRIBUTION_CENTS:
+      String(monthlyContributionCents),
+
+      FIN_ANNUAL_RATE_PPM:
+  String(annualRatePpm),
+
+    FIN_MONTHLY_RATE_PPM:
+      String(monthlyRatePpm),
+
+    FIN_MONTHS:
+      String(months)
+  };
+
+  const startedAt =
+    Date.now();
+
+  const {
+    stdout,
+    stderr
+  } =
+    await execFileAsync(
+      process.execPath,
+      [scriptPath],
+      {
+        cwd: ROOT_DIR,
+        env,
+        timeout: 15 * 60 * 1000,
+        maxBuffer: 20 * 1024 * 1024
+      }
+    );
+
+  const jsonStart =
+    stdout.lastIndexOf("\n{");
+
+  if (jsonStart === -1) {
+    throw new Error(
+      `financial_proof_json_not_found: ${stderr || stdout}`
+    );
+  }
+
+  const result =
+    JSON.parse(
+      stdout.slice(jsonStart + 1).trim()
+    );
+
+  sendJson(res, 200, {
+    ...result,
+
+    calculationVerified:
+      result.financialProofVerified === true,
+
+    proofLinkageVerified:
+      result.linked === true,
+
+    generationTimeMs:
+      Date.now() - startedAt
+  });
+}
 async function handleCompute(req, res) {
   if (isProductionProfile() && !isSettlementEnabled()) {
     sendJson(res, 409, {
@@ -783,7 +923,12 @@ async function route(req, res) {
       sendJson(res, 200, verifyPayment(body.requirement ?? job?.requirement, body.payment));
       return;
     }
-
+    if (req.method === "POST" &&
+      url.pathname === "/api/financial-proof"
+) {
+  await handleFinancialProof(req, res);
+  return;
+}
     if (req.method === "POST" && url.pathname === "/api/compute") {
       await handleCompute(req, res);
       return;
